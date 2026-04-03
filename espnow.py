@@ -23,7 +23,7 @@ import sys
 import time
 
 # ── Config ────────────────────────────────────────────────────────────
-DEFAULT_PORT = "/dev/ttyTHS1"
+DEFAULT_PORT = "/dev/ttyTHS1"  # Jetson Nano onboard UART (ttyTHS1) is usually connected to ESP32
 DEFAULT_BAUD = 115200
 
 # ── Preset commands (type the shortcut instead of full JSON) ──────────
