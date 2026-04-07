@@ -154,8 +154,18 @@ def main():
             now = time.monotonic()
 
             # ── Deadman: expire stale keys ─────────────────────
-            expired = [k for k, t in active_keys.items()
-                       if now - t > KEY_TIMEOUT]
+            expired = []
+
+            for k, (first_seen, last_seen) in active_keys.items():
+                age = now - last_seen
+                held_time = now - first_seen
+
+                # Allow initial OS delay (~0.5s) before enforcing timeout
+                if held_time < 0.5:
+                    continue
+
+                if age > KEY_TIMEOUT:
+                    expired.append(k)
 
             for k in expired:
                 del active_keys[k]
@@ -181,7 +191,11 @@ def main():
                       end="", flush=True)
 
             elif ch in MOVE_KEYS:
-                active_keys[ch] = now
+                if ch not in active_keys:
+                    active_keys[ch] = (now, now)  # first_seen, last_seen
+                else:
+                    first_seen, _ = active_keys[ch]
+                    active_keys[ch] = (first_seen, now)
                 refresh()
 
     except KeyboardInterrupt:
