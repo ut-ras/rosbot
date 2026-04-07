@@ -56,16 +56,34 @@ def make_cmd(L, R):
 STOP_CMD = '{"T":1,"L":0,"R":0}'
 
 def compute_lr(keys):
-    fwd  = "w" in keys and "s" not in keys
-    back = "s" in keys and "w" not in keys
-    rgt  = "d" in keys and "a" not in keys
-    lft  = "a" in keys and "d" not in keys
+    # Forward/back axis
+    forward = 0.0
+    if "w" in keys:
+        forward += 1.0
+    if "s" in keys:
+        forward -= 1.0
 
-    drive    = SPEED if fwd else (-SPEED if back else 0.0)
-    turn_mag = abs(drive) if drive != 0.0 else SPEED * TURN_BLEND
-    turn     = turn_mag if rgt else (-turn_mag if lft else 0.0)
+    # Turn axis
+    turn = 0.0
+    if "d" in keys:
+        turn += 1.0
+    if "a" in keys:
+        turn -= 1.0
 
-    return clamp(drive + turn), clamp(drive - turn)
+    # Differential drive mix
+    left  = forward + turn
+    right = forward - turn
+
+    # Normalize to keep within [-1, 1]
+    max_mag = max(1.0, abs(left), abs(right))
+    left  /= max_mag
+    right /= max_mag
+
+    # Apply speed scaling
+    left  *= SPEED
+    right *= SPEED
+
+    return left, right
 
 # ── Serial helpers ────────────────────────────────────────────────────
 
