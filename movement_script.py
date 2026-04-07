@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """
-WASD Rover Controller — Jetson
-Real-time WASD control over serial to ESP32/rover.
+WASD Rover Controller — Jetson (Refactored)
 
-Key-release detection strategy:
-  - On first press, the key is added to `held` and marked as "pending repeat".
-  - Once OS key-repeat starts firing (~500 ms after press), the key is marked
-    "repeating" and the timeout logic activates.
-  - Only repeating keys are expired by timeout, so the initial repeat-delay
-    gap never triggers a false release.
+Features:
+  - True differential steering (W/S + A/D blending)
+  - Deadman switch (keys expire if not refreshed)
+  - Robust multi-key handling (no OS repeat dependency)
 
 Controls:
   W / S     — forward / back
   A / D     — turn left / right
-  W+D / W+A — curve forward-right / forward-left
   Space     — emergency stop
   Q / Esc   — quit (sends stop first)
 
@@ -34,56 +30,42 @@ import serial
 DEFAULT_PORT = "/dev/ttyTHS1"
 DEFAULT_BAUD = 115200
 
-# All movement commands use this speed. Must be high enough for the
-# motors to overcome static friction and actually move.
-SPEED       = 0.5
+SPEED = 0.5
 
-# Turning blends this fraction of SPEED into the opposite wheel.
-TURN_BLEND  = 0.6
-
-# How long (seconds) without receiving a key before treating it as released.
-# Linux key-repeat fires at ~30 ms intervals, so 80 ms is a safe threshold.
-KEY_TIMEOUT = 0.08
+# Deadman timeout (seconds)
+KEY_TIMEOUT = 0.10
 
 # ─────────────────────────────────────────────────────────────────────
-
-def clamp(v, lo=-SPEED, hi=SPEED):
-    return max(lo, min(hi, v))
 
 def make_cmd(L, R):
     return '{{"T":1,"L":{:.2f},"R":{:.2f}}}'.format(L, R)
 
 STOP_CMD = '{"T":1,"L":0,"R":0}'
 
+# ── Differential Drive ────────────────────────────────────────────────
+
 def compute_lr(keys):
-    # Forward/back axis
     forward = 0.0
     if "w" in keys:
         forward += 1.0
     if "s" in keys:
         forward -= 1.0
 
-    # Turn axis
     turn = 0.0
     if "d" in keys:
         turn += 1.0
     if "a" in keys:
         turn -= 1.0
 
-    # Differential drive mix
     left  = forward + turn
     right = forward - turn
 
-    # Normalize to keep within [-1, 1]
+    # Normalize to preserve ratios
     max_mag = max(1.0, abs(left), abs(right))
     left  /= max_mag
     right /= max_mag
 
-    # Apply speed scaling
-    left  *= SPEED
-    right *= SPEED
-
-    return left, right
+    return left * SPEED, right * SPEED
 
 # ── Serial helpers ────────────────────────────────────────────────────
 
@@ -123,7 +105,7 @@ def main():
     port = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PORT
     baud = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_BAUD
 
-    print(f"\n  WASD Rover Controller")
+    print(f"\n  WASD Rover Controller (Refactored)")
     print(f"  Connecting to {port} @ {baud} baud…\n")
 
     try:
@@ -137,7 +119,8 @@ def main():
     threading.Thread(target=reader_thread, args=(ser,), daemon=True).start()
 
     print("  Connected.")
-    print(f"  Speed: {SPEED}  (fixed)")
+    print(f"  Speed: {SPEED}")
+    print(f"  Deadman timeout: {KEY_TIMEOUT}s")
     print("  W/A/S/D = move   Space = stop   Q = quit\n")
 
     fd       = sys.stdin.fileno()
@@ -145,25 +128,24 @@ def main():
 
     MOVE_KEYS = {"w", "a", "s", "d"}
 
-    held      = set()
-    repeating = set()
-    last_seen = {}
-    last_cmd  = None
+    active_keys = {}   # key -> last_seen timestamp
+    last_cmd = None
 
     def refresh():
         nonlocal last_cmd
-        cmd = make_cmd(*compute_lr(held)) if held else STOP_CMD
+        keys = set(active_keys.keys())
+
+        cmd = make_cmd(*compute_lr(keys)) if keys else STOP_CMD
+
         if cmd != last_cmd:
             send(ser, cmd)
             last_cmd = cmd
-            print(f"\r  → {cmd}   keys={sorted(held) or ['none']}      ",
+            print(f"\r  → {cmd}   keys={sorted(keys) or ['none']}      ",
                   end="", flush=True)
 
     def clear_all():
         nonlocal last_cmd
-        held.clear()
-        repeating.clear()
-        last_seen.clear()
+        active_keys.clear()
         send(ser, STOP_CMD)
         last_cmd = STOP_CMD
 
@@ -171,16 +153,17 @@ def main():
         while True:
             now = time.monotonic()
 
-            # ── Expire released keys (only once repeat has started) ───
-            released = [k for k in repeating if now - last_seen[k] > KEY_TIMEOUT]
-            for k in released:
-                repeating.discard(k)
-                last_seen.pop(k, None)
-                held.discard(k)
-            if released:
+            # ── Deadman: expire stale keys ─────────────────────
+            expired = [k for k, t in active_keys.items()
+                       if now - t > KEY_TIMEOUT]
+
+            for k in expired:
+                del active_keys[k]
+
+            if expired:
                 refresh()
 
-            # ── Read next character ───────────────────────────────────
+            # ── Read input ─────────────────────────────────────
             ch = read_char_nonblocking(fd, timeout=0.02)
             if ch is None:
                 continue
@@ -198,12 +181,8 @@ def main():
                       end="", flush=True)
 
             elif ch in MOVE_KEYS:
-                if ch not in held:
-                    held.add(ch)
-                    refresh()
-                else:
-                    repeating.add(ch)
-                    last_seen[ch] = now
+                active_keys[ch] = now
+                refresh()
 
     except KeyboardInterrupt:
         send(ser, STOP_CMD)
