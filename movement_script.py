@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
 WASD Rover Controller — Jetson
-Wraps esp32_terminal.py logic with real-time keyboard input.
+Real-time WASD control over serial to ESP32/rover.
+
+Key-release is detected by timeout: the OS repeats a held key at ~30 Hz;
+if a key hasn't been seen for KEY_TIMEOUT seconds it's treated as released.
 
 Controls:
   W / S     — forward / back
@@ -9,28 +12,32 @@ Controls:
   W+D / W+A — curve forward-right / forward-left
   Space     — emergency stop
   +/-       — increase / decrease speed (step 0.05)
-  Q         — quit (sends stop first)
+  Q / Esc   — quit (sends stop first)
 
 Usage:
     python3 wasd_rover.py [port] [baud]
-
-Requirements:
-    pip install pynput pyserial
 """
 
 import sys
+import os
 import time
+import termios
+import tty
+import select
 import threading
 import serial
-from pynput import keyboard
 
 # ── Config ────────────────────────────────────────────────────────────
 DEFAULT_PORT = "/dev/ttyTHS1"
 DEFAULT_BAUD = 115200
-DEFAULT_SPEED = 0.25  # 0.0 – 0.5
-TURN_BLEND    = 0.6   # fraction of speed applied to turning component
+DEFAULT_SPEED = 0.25   # 0.0 – 0.5
+TURN_BLEND    = 0.6    # fraction of speed used for turning component
 SPEED_STEP    = 0.05
 MAX_SPEED     = 0.5
+
+# How long (seconds) without receiving a key before treating it as released.
+# Linux key-repeat fires at ~30 ms intervals, so 80 ms is a safe threshold.
+KEY_TIMEOUT   = 0.08
 
 # ─────────────────────────────────────────────────────────────────────
 
@@ -43,15 +50,7 @@ def make_cmd(L, R):
 STOP_CMD = '{"T":1,"L":0,"R":0}'
 
 def compute_lr(keys, speed):
-    """Compute L/R motor values from the current held key set.
-
-    W and S are mutually exclusive (W wins).
-    A and D are mutually exclusive (D wins).
-    Turning scales relative to the forward/back magnitude so that
-    pure A/D pivot-turns use TURN_BLEND speed, and combined W+D / S+A
-    etc. blend the turn into the existing drive component without
-    exceeding the motor range.
-    """
+    """Compute L/R motor values from the current held key set."""
     fwd  = "w" in keys and "s" not in keys
     back = "s" in keys and "w" not in keys
     rgt  = "d" in keys and "a" not in keys
@@ -69,7 +68,6 @@ def send(ser, cmd):
     ser.write((cmd + "\n").encode("utf-8"))
 
 def reader_thread(ser):
-    """Print anything the ESP32 sends back."""
     while True:
         try:
             if ser.in_waiting:
@@ -79,6 +77,24 @@ def reader_thread(ser):
         except Exception:
             break
         time.sleep(0.02)
+
+# ── Raw stdin helpers ─────────────────────────────────────────────────
+
+def set_raw(fd):
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    return old
+
+def restore(fd, old):
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+def read_char_nonblocking(fd, timeout=0.02):
+    """Return a character from stdin if one arrives within `timeout` seconds,
+    otherwise return None."""
+    r, _, _ = select.select([fd], [], [], timeout)
+    if r:
+        return os.read(fd, 1).decode("utf-8", errors="ignore")
+    return None
 
 # ── Main ──────────────────────────────────────────────────────────────
 
@@ -98,16 +114,20 @@ def main():
 
     time.sleep(2)
     ser.reset_input_buffer()
-
     threading.Thread(target=reader_thread, args=(ser,), daemon=True).start()
 
     print("  Connected.")
     print("  W/A/S/D = move   Space = stop   +/- = speed   Q = quit\n")
     print(f"  Speed: {speed:.2f}\n")
 
-    held     = set()
-    last_cmd = None
-    running  = True
+    fd       = sys.stdin.fileno()
+    old_term = set_raw(fd)
+
+    # last_seen[key] = timestamp of most recent keypress event
+    MOVE_KEYS = {"w", "a", "s", "d"}
+    last_seen = {}   # key → float (time.monotonic)
+    held      = set()
+    last_cmd  = None
 
     def refresh():
         nonlocal last_cmd
@@ -118,63 +138,69 @@ def main():
             print(f"\r  → {cmd}   speed={speed:.2f}   keys={sorted(held) or ['none']}      ",
                   end="", flush=True)
 
-    MOVE_KEYS = {"w", "a", "s", "d"}
-
-    def on_press(key):
-        nonlocal speed, running
-
-        # Resolve the character
-        try:
-            ch = key.char.lower() if key.char else None
-        except AttributeError:
-            ch = None
-
-        if ch in MOVE_KEYS:
-            held.add(ch)
-            refresh()
-
-        elif ch in ("+", "="):
-            speed = round(min(MAX_SPEED, speed + SPEED_STEP), 2)
-            print(f"\r  Speed: {speed:.2f}                              ",
-                  end="", flush=True)
-            refresh()
-
-        elif ch in ("-", "_"):
-            speed = round(max(0.0, speed - SPEED_STEP), 2)
-            print(f"\r  Speed: {speed:.2f}                              ",
-                  end="", flush=True)
-            refresh()
-
-        elif ch == "q" or key == keyboard.Key.esc:
-            send(ser, STOP_CMD)
-            print("\n\n  Stopped. Bye.\n")
-            running = False
-            return False  # stops the listener
-
-        elif key == keyboard.Key.space:
-            held.clear()
-            send(ser, STOP_CMD)
-            last_cmd = STOP_CMD
-            print(f"\r  → {STOP_CMD}  [STOP]                            ",
-                  end="", flush=True)
-
-    def on_release(key):
-        try:
-            ch = key.char.lower() if key.char else None
-        except AttributeError:
-            ch = None
-
-        if ch in MOVE_KEYS:
-            held.discard(ch)
-            refresh()
-
     try:
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-            listener.join()
+        while True:
+            now = time.monotonic()
+
+            # ── Expire released keys ──────────────────────────────────
+            released = [k for k, t in last_seen.items() if now - t > KEY_TIMEOUT]
+            for k in released:
+                del last_seen[k]
+                held.discard(k)
+            if released:
+                refresh()
+
+            # ── Read next character (non-blocking, short timeout) ─────
+            ch = read_char_nonblocking(fd, timeout=0.02)
+            if ch is None:
+                continue
+
+            ch = ch.lower()
+
+            # ── Quit ──────────────────────────────────────────────────
+            if ch in ("q", "\x03", "\x1b"):   # q, Ctrl-C, Esc
+                send(ser, STOP_CMD)
+                print("\n\n  Stopped. Bye.\n")
+                break
+
+            # ── Emergency stop ────────────────────────────────────────
+            elif ch == " ":
+                last_seen.clear()
+                held.clear()
+                send(ser, STOP_CMD)
+                last_cmd = STOP_CMD
+                print(f"\r  → {STOP_CMD}  [STOP]                            ",
+                      end="", flush=True)
+
+            # ── Speed adjust ──────────────────────────────────────────
+            elif ch in ("+", "="):
+                speed = round(min(MAX_SPEED, speed + SPEED_STEP), 2)
+                print(f"\r  Speed: {speed:.2f}                              ",
+                      end="", flush=True)
+                refresh()
+
+            elif ch in ("-", "_"):
+                speed = round(max(0.0, speed - SPEED_STEP), 2)
+                print(f"\r  Speed: {speed:.2f}                              ",
+                      end="", flush=True)
+                refresh()
+
+            # ── Movement keys ─────────────────────────────────────────
+            elif ch in MOVE_KEYS:
+                last_seen[ch] = now
+                if ch not in held:
+                    held.add(ch)
+                    refresh()
+                else:
+                    # Key is repeating — just refresh the timestamp, no resend needed
+                    pass
+
     except KeyboardInterrupt:
         send(ser, STOP_CMD)
         print("\n\n  Interrupted — stop sent. Bye.\n")
+
     finally:
+        restore(fd, old_term)
         ser.close()
 
 
