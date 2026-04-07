@@ -161,7 +161,7 @@ def main():
                 held_time = now - first_seen
 
                 # Allow initial OS delay (~0.5s) before enforcing timeout
-                if held_time < 0.5:
+                if held_time < 0.2:
                     continue
 
                 if age > KEY_TIMEOUT:
