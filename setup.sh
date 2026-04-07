@@ -1,3 +1,4 @@
+cat > ~/your-repo/setup.sh << 'EOF'
 #!/bin/bash
 # setup.sh — Run after cloning to build the workspace
 set -e
@@ -10,10 +11,18 @@ fi
 
 source /opt/ros/humble/setup.bash
 
-echo "Installing dependencies..."
+echo "Pulling submodules..."
+git submodule update --init --recursive
+
+echo "Installing ROS 2 dependencies..."
 rosdep install --from-paths src --ignore-src -r -y
 
 echo "Building workspace..."
 colcon build --symlink-install
 
-echo "Done! Now run: source install/setup.bash"
+echo ""
+echo "Done! Run this in every new terminal:"
+echo "  source install/setup.bash"
+EOF
+
+chmod +x setup.sh
