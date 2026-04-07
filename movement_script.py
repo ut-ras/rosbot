@@ -1,76 +1,112 @@
 #!/usr/bin/env python3
 """
-WASD Rover Controller — Jetson (Game-style, evdev)
+WASD Rover Controller — Jetson (Refactored)
 
 Features:
   - True differential steering (W/S + A/D blending)
-  - Game-like WASD behavior (instant key down/up)
-  - No OS key repeat dependency
-  - Emergency stop with Space
-  - Quit with Q or Esc
+  - Deadman switch (keys expire after a short hold window)
+  - Robust multi-key handling (no OS repeat dependency)
+
+Controls:
+  W / S     — forward / back
+  A / D     — turn left / right
+  Space     — emergency stop
+  Q / Esc   — quit (sends stop first)
 
 Usage:
-    sudo python3 wasd_rover_evdev.py [keyboard_event] [serial_port] [baud]
-
-Example:
-    sudo python3 wasd_rover_evdev.py /dev/input/event4 /dev/ttyTHS1 115200
+    python3 wasd_rover.py [port] [baud]
 """
 
 import sys
+import os
 import time
+import termios
+import tty
+import select
 import threading
 import serial
-from evdev import InputDevice, categorize, ecodes, KeyEvent
 
 # ── Config ────────────────────────────────────────────────────────────
 DEFAULT_PORT = "/dev/ttyTHS1"
 DEFAULT_BAUD = 115200
-SPEED = 0.5
-UPDATE_HZ = 50  # control update frequency
 
-# ── Serial / Command Helpers ───────────────────────────────────────────
+SPEED = 0.5
+
+# Deadman hold window (seconds)
+HOLD_TIMEOUT = 0.25  # keys expire if not pressed for this duration
+
+# ─────────────────────────────────────────────────────────────────────
+
 def make_cmd(L, R):
     return '{{"T":1,"L":{:.2f},"R":{:.2f}}}'.format(L, R)
 
 STOP_CMD = '{"T":1,"L":0,"R":0}'
 
+# ── Differential Drive ────────────────────────────────────────────────
+
+def compute_lr(keys):
+    forward = 0.0
+    if "w" in keys:
+        forward += 1.0
+    if "s" in keys:
+        forward -= 1.0
+
+    turn = 0.0
+    if "d" in keys:
+        turn += 1.0
+    if "a" in keys:
+        turn -= 1.0
+
+    left  = forward + turn
+    right = forward - turn
+
+    # Normalize to preserve ratios
+    max_mag = max(1.0, abs(left), abs(right))
+    left  /= max_mag
+    right /= max_mag
+
+    return left * SPEED, right * SPEED
+
+# ── Serial helpers ────────────────────────────────────────────────────
+
 def send(ser, cmd):
     ser.write((cmd + "\n").encode("utf-8"))
 
-# ── Differential Steering ─────────────────────────────────────────────
-def compute_lr(keys):
-    """Compute left/right wheel speeds from current key states"""
-    fwd = (1 if keys['w'] else 0) - (1 if keys['s'] else 0)
-    turn = (1 if keys['d'] else 0) - (1 if keys['a'] else 0)
-    left = fwd + turn
-    right = fwd - turn
-    max_mag = max(1.0, abs(left), abs(right))
-    return (left / max_mag) * SPEED, (right / max_mag) * SPEED
+def reader_thread(ser):
+    while True:
+        try:
+            if ser.in_waiting:
+                line = ser.readline().decode("utf-8", errors="replace").strip()
+                if line:
+                    print(f"\r  ← {line}")
+        except Exception:
+            break
+        time.sleep(0.02)
 
-# ── Map evdev scancodes to WASD / Space ────────────────────────────────
-EVDEV_KEY_MAP = {
-    ecodes.KEY_W: 'w',
-    ecodes.KEY_A: 'a',
-    ecodes.KEY_S: 's',
-    ecodes.KEY_D: 'd',
-    ecodes.KEY_SPACE: 'space',
-    ecodes.KEY_Q: 'q',
-    ecodes.KEY_ESC: 'esc'
-}
+# ── Raw stdin helpers ─────────────────────────────────────────────────
+
+def set_raw(fd):
+    old = termios.tcgetattr(fd)
+    tty.setraw(fd)
+    return old
+
+def restore(fd, old):
+    termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+def read_char_nonblocking(fd, timeout=0.02):
+    r, _, _ = select.select([fd], [], [], timeout)
+    if r:
+        return os.read(fd, 1).decode("utf-8", errors="ignore")
+    return None
 
 # ── Main ──────────────────────────────────────────────────────────────
+
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: sudo python3 wasd_rover_evdev.py [keyboard_event] [serial_port] [baud]")
-        sys.exit(1)
+    port = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PORT
+    baud = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_BAUD
 
-    kb_event = sys.argv[1]
-    port = sys.argv[2] if len(sys.argv) > 2 else DEFAULT_PORT
-    baud = int(sys.argv[3]) if len(sys.argv) > 3 else DEFAULT_BAUD
-
-    print(f"\n  WASD Rover Controller (Game-style)")
-    print(f"  Keyboard: {kb_event}")
-    print(f"  Serial: {port} @ {baud} baud\n")
+    print(f"\n  WASD Rover Controller (Refactored)")
+    print(f"  Connecting to {port} @ {baud} baud…\n")
 
     try:
         ser = serial.Serial(port, baud, timeout=0.1)
@@ -78,59 +114,83 @@ def main():
         print(f"  [!] Could not open {port}: {e}")
         sys.exit(1)
 
-    keys_state = { 'w': False, 'a': False, 's': False, 'd': False, 'space': False }
+    time.sleep(2)
+    ser.reset_input_buffer()
+    threading.Thread(target=reader_thread, args=(ser,), daemon=True).start()
 
-    # ── Keyboard reader thread ──────────────────────────────────────────
-    def kb_thread():
-        dev = InputDevice(kb_event)
-        for event in dev.read_loop():
-            if event.type == ecodes.EV_KEY:
-                key_event = categorize(event)
-                key_name = EVDEV_KEY_MAP.get(key_event.scancode)
-                if key_name:
-                    if key_event.keystate == KeyEvent.key_down:
-                        keys_state[key_name] = True
-                    elif key_event.keystate == KeyEvent.key_up:
-                        keys_state[key_name] = False
+    print("  Connected.")
+    print(f"  Speed: {SPEED}")
+    print(f"  Deadman hold window: {HOLD_TIMEOUT}s")
+    print("  W/A/S/D = move   Space = stop   Q = quit\n")
 
-    threading.Thread(target=kb_thread, daemon=True).start()
+    fd       = sys.stdin.fileno()
+    old_term = set_raw(fd)
 
-    # ── Main control loop ───────────────────────────────────────────────
+    MOVE_KEYS = {"w", "a", "s", "d"}
+
+    # key -> last_pressed timestamp
+    active_keys = {}
     last_cmd = None
+
+    def refresh():
+        nonlocal last_cmd
+        keys = set(active_keys.keys())
+        cmd = make_cmd(*compute_lr(keys)) if keys else STOP_CMD
+
+        if cmd != last_cmd:
+            send(ser, cmd)
+            last_cmd = cmd
+            print(f"\r  → {cmd}   keys={sorted(keys) or ['none']}      ",
+                  end="", flush=True)
+
+    def clear_all():
+        nonlocal last_cmd
+        active_keys.clear()
+        send(ser, STOP_CMD)
+        last_cmd = STOP_CMD
+
     try:
         while True:
-            # Emergency stop
-            if keys_state.get('space'):
-                cmd = STOP_CMD
-            else:
-                # Compute differential wheel speeds
-                L, R = compute_lr(keys_state)
-                # Only move if any WASD key is pressed
-                if any(keys_state[k] for k in ['w','a','s','d']):
-                    cmd = make_cmd(L, R)
-                else:
-                    cmd = STOP_CMD
+            now = time.monotonic()
 
-            if cmd != last_cmd:
-                send(ser, cmd)
-                last_cmd = cmd
-                print(f"\r  → {cmd}   keys={ [k for k,v in keys_state.items() if v] }      ",
-                      end="", flush=True)
+            # ── Deadman: expire keys if not pressed recently ─────
+            expired = [k for k, t in active_keys.items() if now - t > HOLD_TIMEOUT]
+            for k in expired:
+                del active_keys[k]
 
-            # Quit keys
-            if keys_state.get('q') or keys_state.get('esc'):
+            if expired:
+                refresh()
+
+            # ── Read input ─────────────────────────────────────
+            ch = read_char_nonblocking(fd, timeout=0.02)
+            if ch is None:
+                continue
+
+            ch = ch.lower()
+
+            if ch in ("q", "\x03", "\x1b"):
                 send(ser, STOP_CMD)
                 print("\n\n  Stopped. Bye.\n")
                 break
 
-            time.sleep(1 / UPDATE_HZ)
+            elif ch == " ":
+                clear_all()
+                print(f"\r  → {STOP_CMD}  [STOP]                            ",
+                      end="", flush=True)
+
+            elif ch in MOVE_KEYS:
+                # refresh hold timer for the key
+                active_keys[ch] = now
+                refresh()
 
     except KeyboardInterrupt:
         send(ser, STOP_CMD)
         print("\n\n  Interrupted — stop sent. Bye.\n")
 
     finally:
+        restore(fd, old_term)
         ser.close()
+
 
 if __name__ == "__main__":
     main()
