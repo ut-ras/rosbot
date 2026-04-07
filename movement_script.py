@@ -4,7 +4,7 @@ WASD Rover Controller — Jetson (Refactored)
 
 Features:
   - True differential steering (W/S + A/D blending)
-  - Deadman switch (keys expire if not refreshed)
+  - Deadman switch (keys expire after a short hold window)
   - Robust multi-key handling (no OS repeat dependency)
 
 Controls:
@@ -32,8 +32,8 @@ DEFAULT_BAUD = 115200
 
 SPEED = 0.5
 
-# Deadman timeout (seconds)
-KEY_TIMEOUT = 0.10
+# Deadman hold window (seconds)
+HOLD_TIMEOUT = 0.25  # keys expire if not pressed for this duration
 
 # ─────────────────────────────────────────────────────────────────────
 
@@ -120,7 +120,7 @@ def main():
 
     print("  Connected.")
     print(f"  Speed: {SPEED}")
-    print(f"  Deadman timeout: {KEY_TIMEOUT}s")
+    print(f"  Deadman hold window: {HOLD_TIMEOUT}s")
     print("  W/A/S/D = move   Space = stop   Q = quit\n")
 
     fd       = sys.stdin.fileno()
@@ -128,13 +128,13 @@ def main():
 
     MOVE_KEYS = {"w", "a", "s", "d"}
 
-    active_keys = {}   # key -> last_seen timestamp
+    # key -> last_pressed timestamp
+    active_keys = {}
     last_cmd = None
 
     def refresh():
         nonlocal last_cmd
         keys = set(active_keys.keys())
-
         cmd = make_cmd(*compute_lr(keys)) if keys else STOP_CMD
 
         if cmd != last_cmd:
@@ -153,20 +153,8 @@ def main():
         while True:
             now = time.monotonic()
 
-            # ── Deadman: expire stale keys ─────────────────────
-            expired = []
-
-            for k, (first_seen, last_seen) in active_keys.items():
-                age = now - last_seen
-                held_time = now - first_seen
-
-                # Allow initial OS delay (~0.5s) before enforcing timeout
-                if held_time < 0.5:
-                    continue
-
-                if age > KEY_TIMEOUT:
-                    expired.append(k)
-
+            # ── Deadman: expire keys if not pressed recently ─────
+            expired = [k for k, t in active_keys.items() if now - t > HOLD_TIMEOUT]
             for k in expired:
                 del active_keys[k]
 
@@ -191,11 +179,8 @@ def main():
                       end="", flush=True)
 
             elif ch in MOVE_KEYS:
-                if ch not in active_keys:
-                    active_keys[ch] = (now, now)  # first_seen, last_seen
-                else:
-                    first_seen, _ = active_keys[ch]
-                    active_keys[ch] = (first_seen, now)
+                # refresh hold timer for the key
+                active_keys[ch] = now
                 refresh()
 
     except KeyboardInterrupt:
