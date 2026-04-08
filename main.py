@@ -1,5 +1,5 @@
 from ollama import chat
-from TTS.api import TTS
+from piper.voice import PiperVoice
 from faster_whisper import WhisperModel
 import pyaudio
 import webrtcvad
@@ -7,11 +7,22 @@ import numpy as np
 import subprocess
 import time
 import re
-import threading
-import queue
+import os
+# Suppress ALSA junk
+os.environ['PYTHONWARNINGS'] = 'ignore'
+devnull = os.open(os.devnull, os.O_WRONLY)
+old_stderr = os.dup(2)
+os.dup2(devnull, 2)
+
+pa    = pyaudio.PyAudio()
+audio = pyaudio.PyAudio()
+
+os.dup2(old_stderr, 2)  # restore stderr
+os.close(devnull)
+os.close(old_stderr)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-WAKE_WORD          = "hey fish on the wall"
+WAKE_WORD          = "fish on the wall"
 MIC_DEVICE_INDEX   = None
 SAMPLE_RATE        = 16000
 FRAME_MS           = 30
@@ -19,21 +30,29 @@ FRAME_BYTES        = int(SAMPLE_RATE * FRAME_MS / 1000) * 2
 SILENCE_TIMEOUT    = 1.5
 VAD_AGGRESSIVENESS = 2
 LLM_MODEL          = 'llama3.2'
-SINK               = "alsa_output.usb-Jieli_Technology_UACDemoV1.0_415035313136340C-00.stereo-fallback"
+PIPER_MODEL        = "/tmp/en_US-lessac-medium.onnx"
 SOURCE             = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 print("Loading TTS model...")
-tts = TTS("tts_models/en/ljspeech/tacotron2-DDC")
+tts_voice  = PiperVoice.load(PIPER_MODEL)
+pa         = pyaudio.PyAudio()
+# Replace the tts_stream init with a larger buffer
+tts_stream = pa.open(
+    format=pyaudio.paInt16,
+    channels=1,
+    rate=22050,
+    output=True,
+    frames_per_buffer=4096  # larger buffer prevents underruns
+)
 print("TTS ready.")
 
 print("Loading Whisper model...")
 whisper = WhisperModel("tiny.en", device="cpu", compute_type="int8", cpu_threads=4, num_workers=2)
 print("Whisper ready.")
 
-vad        = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-audio      = pyaudio.PyAudio()
-speak_lock = threading.Lock()  # prevent overlapping speech
+vad   = webrtcvad.Vad(VAD_AGGRESSIVENESS)
+audio = pyaudio.PyAudio()
 
 messages = [
     {"role": "system", "content": "You are a helpful assistant. Keep your answers concise. I mean as short as possible. Like, really short."},
@@ -78,7 +97,7 @@ def transcribe(audio_bytes: bytes) -> str:
     return " ".join(seg.text for seg in segments).strip()
 
 def listen_for_wake_word() -> str | None:
-    print(f"\nWaiting for wake word: '{WAKE_WORD}'...")
+    print(f"\nWaiting for wake word: 'hey {WAKE_WORD}'...")
     while True:
         audio_bytes = record_until_silence()
         if not audio_bytes:
@@ -93,69 +112,49 @@ def listen_for_wake_word() -> str | None:
             return transcribe(record_until_silence())
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
-def speak_sentence(sentence: str):
-    """Synthesize and play a single sentence."""
-    sentence = sentence.strip()
-    if not sentence:
-        return
-    tts.tts_to_file(text=sentence, file_path="/tmp/speech.wav")
-    subprocess.run(["aplay", "/tmp/speech.wav"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-def speak_streaming(text: str):
-    """Split into sentences and speak each as soon as it's synthesized."""
+def speak(text: str):
     print(f"Assistant: {text}")
     subprocess.run(["pactl", "set-source-mute", SOURCE, "1"])
 
-    # Split on sentence boundaries
-    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    import io, wave
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, 'wb') as wav_file:
+        tts_voice.synthesize_wav(text, wav_file)
 
-    for sentence in sentences:
-        speak_sentence(sentence)
+    wav_io.seek(0)
+    with wave.open(wav_io, 'rb') as wav_file:
+        rate     = wav_file.getframerate()
+        n_frames = wav_file.getnframes()
+        raw      = wav_file.readframes(n_frames)
 
+    # Reopen stream at correct sample rate if needed
+    global tts_stream
+    if tts_stream._rate != rate:
+        tts_stream.stop_stream()
+        tts_stream.close()
+        tts_stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=rate,
+            output=True,
+            frames_per_buffer=4096
+        )
+
+    tts_stream.write(raw)
     time.sleep(0.3)
     subprocess.run(["pactl", "set-source-mute", SOURCE, "0"])
 
-# ── LLM with streaming ────────────────────────────────────────────────────────
-def ask_streaming(user_input: str):
-    """
-    Stream tokens from Ollama, accumulate into sentences,
-    and speak each sentence as soon as it's complete.
-    """
+# ── LLM ───────────────────────────────────────────────────────────────────────
+def ask(user_input: str) -> str:
     messages.append({"role": "user", "content": user_input})
-    subprocess.run(["pactl", "set-source-mute", SOURCE, "1"])
-
-    buffer   = ""
-    full     = ""
-    sentence_end = re.compile(r'(?<=[.!?])\s+')
-
-    print("Assistant: ", end="", flush=True)
-
-    for chunk in chat(LLM_MODEL, messages=messages, stream=True):
-        token = chunk['message']['content']
-        print(token, end="", flush=True)
-        buffer += token
-        full   += token
-
-        # Speak each complete sentence immediately
-        parts = sentence_end.split(buffer)
-        if len(parts) > 1:
-            for sentence in parts[:-1]:
-                speak_sentence(sentence)
-            buffer = parts[-1]  # keep incomplete sentence for next chunk
-
-    # Speak any remaining text
-    if buffer.strip():
-        speak_sentence(buffer)
-
-    print()  # newline after streamed output
-    messages.append({"role": "assistant", "content": full})
-
-    time.sleep(0.3)
-    subprocess.run(["pactl", "set-source-mute", SOURCE, "0"])
+    response = chat(LLM_MODEL, messages=messages)
+    reply = response['message']['content']
+    messages.append({"role": "assistant", "content": reply})
+    return reply
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    speak_streaming("Ready. Say hey fish on the wall to wake me up.")
+    speak("Ready. Say hey fish on the wall to wake me up.")
 
     while True:
         command = listen_for_wake_word()
@@ -163,4 +162,5 @@ if __name__ == "__main__":
             continue
 
         print(f"You: {command}")
-        ask_streaming(command)  # streams LLM tokens and speaks sentence by sentence
+        reply = ask(command)
+        speak(reply)
