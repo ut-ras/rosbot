@@ -45,15 +45,15 @@ STOP_CMD = '{"T":1,"L":0,"R":0}'
 
 # ── Serial helpers ───────────────────────────────────────────────────────
 
-def build_cmd(left: float, right: float) -> str:
+def build_cmd(left: float, right: float):
     left  = max(-1.0, min(1.0, left))
     right = max(-1.0, min(1.0, right))
     return f'{{"T":1,"L":{left:.2f},"R":{right:.2f}}}'
 
-def send(ser: serial.Serial, cmd: str) -> None:
+def send(ser: serial.Serial, cmd: str):
     ser.write((cmd + "\n").encode("utf-8"))
 
-def reader_thread(ser: serial.Serial) -> None:
+def reader_thread(ser: serial.Serial):
     """Background thread — prints anything the ESP32 sends back."""
     while True:
         try:
@@ -70,7 +70,7 @@ def reader_thread(ser: serial.Serial) -> None:
 
 # ── Key reading ──────────────────────────────────────────────────────────
 
-def read_key() -> str | None:
+def read_key():
     """
     Non-blocking single-character read from stdin.
     Returns the character, or None if nothing is available.
@@ -87,7 +87,7 @@ def read_key() -> str | None:
 
 # ── Mixer ────────────────────────────────────────────────────────────────
 
-def mix(held: set) -> tuple[float, float]:
+def mix(held: set):
     # ── Normalized throttle axis ─────────────────────
     throttle = 0.0
     if "W" in held:
@@ -147,10 +147,10 @@ DIRECTION_LABEL = {
     frozenset({"S", "D"}):  "vv/ fast rev-right",
 }
 
-def label_for(held: set) -> str:
+def label_for(held: set):
     return DIRECTION_LABEL.get(frozenset(held), f"keys: {sorted(held)}")
 
-def print_controls() -> None:
+def print_controls():
     print("""
   +------------------------------------------+
   |   ROVER WASD CONTROLLER                  |
@@ -168,7 +168,7 @@ def print_controls() -> None:
 
 # ── Main ─────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main():
     port = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_PORT
     baud = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_BAUD
 
