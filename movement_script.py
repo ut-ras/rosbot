@@ -69,7 +69,7 @@ def reader_thread(ser: serial.Serial) -> None:
 
 # ── Key reading ──────────────────────────────────────────────────────────
 
-def read_key() -> str | None:
+def read_key():
     """
     Non-blocking single-character read from stdin.
     Returns the character, or None if nothing is available.
