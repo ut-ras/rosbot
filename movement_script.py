@@ -36,7 +36,7 @@ POLL_HZ       = 20          # How often the mixer runs (Hz)
 SEND_HZ       = 10          # Max rate at which duplicate commands are resent
 
 # ── Speed values ────────────────────────────────────────────────────────
-THROTTLE_NORMAL = 0.60      # W / S thrust
+THROTTLE_NORMAL = 1.00      # W / S thrust
 THROTTLE_FAST   = 1.00      # Shift + W / S thrust
 TURN_NORMAL     = 0.40      # A / D turn authority
 TURN_FAST       = 0.65      # Shift + A / D turn authority
