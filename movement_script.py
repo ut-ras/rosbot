@@ -18,7 +18,8 @@ Usage:
     python3 rover_wasd.py [port] [baud]
     python3 rover_wasd.py /dev/ttyTHS1 115200
 """
-
+from typing import Optional
+from typing import Set, Tuple
 import serial
 import serial.tools.list_ports
 import threading
@@ -69,7 +70,7 @@ def reader_thread(ser: serial.Serial) -> None:
 
 # ── Key reading ──────────────────────────────────────────────────────────
 
-def read_key():
+def read_key() -> str | None:
     """
     Non-blocking single-character read from stdin.
     Returns the character, or None if nothing is available.
