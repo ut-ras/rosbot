@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.8)
+project(rover_description)
+
+find_package(ament_cmake REQUIRED)
+
+# Install urdf and launch directories into the package share
+install(
+  DIRECTORY urdf launch
+  DESTINATION share/${PROJECT_NAME}
+)
+
+ament_package()
