@@ -88,44 +88,37 @@ def read_key():
 # ── Mixer ────────────────────────────────────────────────────────────────
 
 def mix(held: set):
-    # ── Normalized throttle axis ─────────────────────
+    # ── 1. Raw axis inputs (NO asymmetric weighting) ──
     throttle = 0.0
-    if "W" in held:
+    if "w" in held or "W" in held:
         throttle += 1.0
-    elif "w" in held:
-        throttle += 0.6
-    if "S" in held:
+    if "s" in held or "S" in held:
         throttle -= 1.0
-    elif "s" in held:
-        throttle -= 0.6
 
-    # ── Normalized turn axis ─────────────────────────
     turn = 0.0
-    if "D" in held:
+    if "d" in held or "D" in held:
         turn += 1.0
-    elif "d" in held:
-        turn += 0.6
-    if "A" in held:
+    if "a" in held or "A" in held:
         turn -= 1.0
-    elif "a" in held:
-        turn -= 0.6
 
-    # ── Optional: speed-aware turning (recommended) ──
+    # ── 2. Speed-dependent steering attenuation ───────
     turn *= (1.0 - 0.5 * abs(throttle))
 
-    # ── Differential mix (arcade drive) ──────────────
+    # ── 3. Differential drive mix ─────────────────────
     left  = throttle + turn
     right = throttle - turn
 
-    # ── Normalize to preserve ratios ────────────────
-    max_mag = max(1.0, abs(left), abs(right))
-    left  /= max_mag
-    right /= max_mag
+    # ── 4. Normalize ONLY if necessary ────────────────
+    max_mag = max(abs(left), abs(right))
 
-    # ── FINAL SCALING → match your hardware range ───
-    MAX_OUTPUT = 0.5
-    left  *= MAX_OUTPUT
-    right *= MAX_OUTPUT
+    if max_mag > 1.0:
+        left  /= max_mag
+        right /= max_mag
+
+    # ── 5. Scale to hardware range ────────────────────
+    SCALE = 0.5
+    left  *= SCALE
+    right *= SCALE
 
     return left, right
 # ── UI ───────────────────────────────────────────────────────────────────
