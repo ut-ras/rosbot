@@ -1,0 +1,31 @@
+ekf_filter_node:
+  ros__parameters:
+    frequency: 30.0
+    sensor_timeout: 0.1
+    two_d_mode: false         # false = full 3D, good for uneven terrain
+    publish_tf: true
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom
+
+    # Visual odometry from rtabmap_odom
+    odom0: /odom
+    odom0_config: [true,  true,  true,   # x, y, z position
+                   false, false, false,  # roll, pitch, yaw (from IMU)
+                   false, false, false,  # vx, vy, vz
+                   false, false, false,  # vroll, vpitch, vyaw
+                   false, false, false]  # ax, ay, az
+    odom0_differential: false
+    odom0_relative: false
+
+    # Filtered IMU from madgwick
+    imu0: /imu/filtered
+    imu0_config: [false, false, false,   # x, y, z (IMU has no position)
+                  true,  true,  true,    # roll, pitch, yaw orientation
+                  false, false, false,   # vx, vy, vz
+                  true,  true,  true,    # vroll, vpitch, vyaw
+                  true,  true,  true]    # ax, ay, az acceleration
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravitational_acceleration: true  # critical for D435if

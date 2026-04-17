@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>rover_odometry</name>
+  <version>0.1.0</version>
+  <description>VIO odometry pipeline for the autonomous rover</description>
+  <maintainer email="your@email.com">Your Name</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>robot_localization</depend>
+  <depend>imu_filter_madgwick</depend>
+  <depend>rtabmap_ros</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

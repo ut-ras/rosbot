@@ -1,0 +1,8 @@
+imu_filter_madgwick:
+  ros__parameters:
+    use_mag: false          # D435if has no magnetometer, must be false
+    publish_tf: false       # EKF handles TF, not this node
+    world_frame: "enu"      # East-North-Up coordinate convention
+    gain: 0.1               # Filter gain, lower = smoother but slower
+    zeta: 0.0               # Gyro drift compensation, 0 since no mag
+    orientation_stddev: 0.0
