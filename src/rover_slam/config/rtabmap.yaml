@@ -1,0 +1,36 @@
+rtabmap:
+  ros__parameters:
+
+    frame_id: base_link
+    odom_frame_id: odom
+    map_frame_id: map
+
+    subscribe_depth: true
+    subscribe_rgb: true
+    subscribe_scan: true
+    subscribe_odom: true
+
+    approx_sync: true
+    approx_sync_max_interval: 0.05
+
+    Rtabmap/DetectionRate: "1.0"
+    Rtabmap/TimeThr: "0"
+    Rtabmap/MemoryThr: "0"
+
+    Rtabmap/LoopThr: "0.11"
+    RGBD/LoopClosureReextractFeatures: "false"
+
+    Vis/MaxFeatures: "400"
+    Vis/MinInliers: "15"
+
+    RGBD/NeighborLinkRefining: "true"
+    Reg/Strategy: "1"
+    Reg/Force3DoF: "false"
+
+    RGBD/AngularUpdate: "0.1"
+    RGBD/LinearUpdate: "0.1"
+    Grid/CellSize: "0.05"
+    Grid/RangeMax: "5.0"
+
+    Mem/STMSize: "30"
+    Mem/RehearsalSimilarity: "0.45"
