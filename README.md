@@ -1,4 +1,3 @@
-cat > ~/your-repo/README.md << 'EOF'
 # Rover Autonomous Navigation
 
 Autonomous exploration rover using ROS 2 Humble, Intel RealSense D435if, and RPLIDAR.
