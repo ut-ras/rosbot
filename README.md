@@ -3,6 +3,9 @@
 Autonomous exploration rover using ROS 2 Humble, Intel RealSense D435if, and RPLIDAR.
 Designed to run on Jetson Orin Nano (Ubuntu 22.04). Development mimicked on Ubuntu 22.04 laptops.
 
+For a complete Windows 11 + WSL 2 camera and stereo/IMU mapping setup, see
+[Intel RealSense D435IF on ROS 2 Humble and WSL 2](docs/d435if_wsl_ros2_setup.md).
+
 ## Hardware
 - Jetson Orin Nano
 - Intel RealSense D435if (RGB-D + IMU)
