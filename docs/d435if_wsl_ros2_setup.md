@@ -24,6 +24,8 @@ D435IF infrared stereo ──> RTAB-Map stereo odometry ──> RTAB-Map
 - [6. Build a WSL-compatible librealsense](#6-build-a-wsl-compatible-librealsense)
 - [7. Build the ROS workspace](#7-build-the-ros-workspace)
 - [8. Verify the SDK and camera](#8-verify-the-sdk-and-camera)
+- [How the mapping algorithm works](#how-the-mapping-algorithm-works)
+- [Implementation roadmap](#implementation-roadmap)
 - [9. Start the complete stereo, IMU, RGB, and RTAB-Map stack](#9-start-the-complete-stereo-imu-rgb-and-rtab-map-stack)
 - [10. Expected topics and rates](#10-expected-topics-and-rates)
 - [11. Saving and reopening a map](#11-saving-and-reopening-a-map)
@@ -312,9 +314,82 @@ Do not run `sudo rs-enumerate-devices`. Running it as root changes configuration
 
 For firmware updates, detach the camera from WSL and use the native Windows RealSense Viewer. Do not force an unsigned firmware image through WSL. A message such as `Unsupported firmware binary image (unsigned)` means the selected image or update path is not accepted; it does not mean that the camera must be forcibly updated.
 
+## How the mapping algorithm works
+
+1. **Sensor acquisition:** The D435IF publishes two rectified monochrome images from its infrared stereo pair. Their camera-info messages contain the calibrated projection models, and the camera's static transforms describe the fixed baseline between the imagers.
+2. **IMU orientation:** The gyroscope measures short-term angular motion and the accelerometer observes gravity plus linear acceleration. Madgwick integrates the gyroscope and uses gravity to correct roll and pitch drift. Because the D435IF has no magnetometer, absolute yaw remains unobservable and can drift over time.
+3. **Stereo geometry:** RTAB-Map finds visual features in the left and right images and matches them across the known stereo baseline. Disparity between a matched pair triangulates a three-dimensional landmark. Nearby or incorrectly matched features are rejected by geometric checks.
+4. **Visual odometry:** Features are matched again across consecutive time steps. RTAB-Map estimates the six-degree-of-freedom camera transform that best explains the 3D correspondences. The IMU orientation provides gravity alignment and a rotational prior; it does not replace visual translation estimation.
+5. **Keyframe graph:** Selected frames become graph nodes. Short-range odometry constraints connect neighboring nodes. RTAB-Map manages recent, working, and long-term memories so the graph can grow without comparing every frame against every previous frame.
+6. **Loop closure:** A visual place-recognition stage proposes previously visited locations. RTAB-Map verifies each proposal geometrically before adding a loop-closure constraint, reducing the risk of corrupting the map with a false match.
+7. **Graph optimization:** When constraints are added, RTAB-Map optimizes the pose graph. The `odom` frame remains locally continuous, while the `map` to `odom` transform absorbs global corrections from loop closures.
+8. **Map output:** Optimized poses place the stereo-derived 3D observations into a consistent global map. The current stereo pipeline uses infrared imagery, so its visual map is grayscale. The optional RGB topic is published independently and is not automatically fused into standard stereo RTAB-Map.
+
+This is stereo visual odometry aided by a filtered IMU orientation. It is not a tightly coupled visual-inertial optimizer: the camera remains responsible for translation and most tracking constraints, while the IMU primarily supplies gravity alignment and a rotation estimate.
+
+The main transforms are conceptually:
+
+```text
+map ──loop-closure correction──> odom ──stereo odometry──> camera_link
+                                                              │
+                                                              └── static sensor transforms
+                                                                  ├── infra1 optical frame
+                                                                  ├── infra2 optical frame
+                                                                  └── IMU optical frame
+```
+
+## Implementation roadmap
+
+1. **Repeatable sensor bringup — implemented:** Forward the camera into WSL, use the RSUSB librealsense backend, enforce matching SDK versions, and verify both infrared images plus the combined IMU.
+2. **Single-command mapping — implemented:** `d435if_stereo_slam.launch.py` starts the camera, Madgwick, RTAB-Map stereo odometry, mapping, and visualization with the tested topic names and synchronization settings.
+3. **Repeatable datasets — next:** Record stereo, camera-info, IMU, and TF topics in rosbag2. Use a fixed indoor route and compare frame gaps, odometry inliers, drift, loop closures, and CPU load after every parameter change.
+4. **Robot-frame integration — next:** Add the measured static transform from `base_link` to `camera_link`, change the mapper's tracking frame to `base_link`, and verify that only one component publishes each dynamic TF edge.
+5. **Wheel odometry — next:** Feed calibrated wheel odometry into the robot state estimator. Use it as a motion prior or external odometry source without allowing two nodes to publish competing `odom` transforms.
+6. **LiDAR and navigation — later:** Add the RPLIDAR scan after visual mapping is stable, generate a 2D occupancy grid, and connect the resulting `map -> odom -> base_link` tree to Nav2.
+7. **RGB products — optional:** Keep RGB independent for detection or logging, or validate a separate aligned RGB-D mapping mode when a colored map is required.
+
 ## 9. Start the complete stereo, IMU, RGB, and RTAB-Map stack
 
-Use separate terminals and start them in order. The environment setup is intentionally repeated so that each terminal is self-contained.
+### Unified launch file (recommended)
+
+After rebuilding the workspace, start the known-good stereo/IMU mapper with one command:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/rosbot/install/setup.bash
+export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+unset RMW_IMPLEMENTATION
+unset ROS_LOCALHOST_ONLY
+
+ros2 launch rover_slam d435if_stereo_slam.launch.py
+```
+
+RGB is disabled by default because the stereo mapper does not consume it. Enable the independent RGB stream when needed:
+
+```bash
+ros2 launch rover_slam d435if_stereo_slam.launch.py enable_rgb:=true
+```
+
+Continue the existing `~/.ros/rtabmap.db` instead of deleting it:
+
+```bash
+ros2 launch rover_slam d435if_stereo_slam.launch.py new_map:=false
+```
+
+Useful launch arguments are:
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `enable_rgb` | `false` | Publish the optional RGB stream. |
+| `infra_profile` | `424x240x6` | Left/right infrared resolution and rate. |
+| `color_profile` | `640x480x6` | Optional RGB resolution and rate. |
+| `frame_id` | `camera_link` | RTAB-Map tracking frame. Use the robot base frame only after its static transform is available. |
+| `new_map` | `true` | Delete the old database and start a new graph. |
+| `rtabmap_viz` | `true` | Start the RTAB-Map GUI. |
+
+### Manual launch for debugging
+
+The following separate-terminal procedure exposes each pipeline stage individually. Use it when diagnosing topic rates or synchronization. Start the terminals in order. The environment setup is intentionally repeated so that each terminal is self-contained.
 
 ### Terminal 1: RealSense camera
 
@@ -330,7 +405,6 @@ ros2 launch realsense2_camera rs_launch.py \
   enable_color:=true \
   rgb_camera.color_profile:=640x480x6 \
   rgb_camera.enable_auto_exposure:=true \
-  rgb_camera.auto_exposure_priority:=false \
   enable_depth:=false \
   enable_infra1:=true \
   enable_infra2:=true \
@@ -345,7 +419,15 @@ ros2 launch realsense2_camera rs_launch.py \
   pointcloud.enable:=false
 ```
 
-Wait for `RealSense Node Is Up!`. Occasional `control_transfer returned error` warnings can be tolerated only if all required topics continue publishing at stable rates.
+Wait for `RealSense Node Is Up!`. When RGB is enabled, use another terminal to prevent auto exposure from lowering its frame rate:
+
+```bash
+ros2 param set /camera/camera rgb_camera.auto_exposure_priority false
+```
+
+This sensor option is set directly by the unified `rover_slam` launch file. It is not a declared command-line argument in the pinned `rs_launch.py`, so the manual launch configures it after the camera node starts.
+
+Occasional `control_transfer returned error` warnings can be tolerated only if all required topics continue publishing at stable rates.
 
 If simultaneous RGB causes instability under WSL, set `enable_color:=false` and establish reliable stereo/IMU mapping first. RGB is not required by the stereo RTAB-Map configuration.
 
