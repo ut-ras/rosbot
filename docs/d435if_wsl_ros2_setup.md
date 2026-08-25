@@ -26,6 +26,7 @@ D435IF infrared stereo ──> RTAB-Map stereo odometry ──> RTAB-Map
 - [8. Verify the SDK and camera](#8-verify-the-sdk-and-camera)
 - [How the mapping algorithm works](#how-the-mapping-algorithm-works)
 - [Implementation roadmap](#implementation-roadmap)
+- [Wiki-derived RGB-D mode](#wiki-derived-rgb-d-mode)
 - [9. Start the complete stereo, IMU, RGB, and RTAB-Map stack](#9-start-the-complete-stereo-imu-rgb-and-rtab-map-stack)
 - [10. Expected topics and rates](#10-expected-topics-and-rates)
 - [11. Saving and reopening a map](#11-saving-and-reopening-a-map)
@@ -346,7 +347,65 @@ map ──loop-closure correction──> odom ──stereo odometry──> camer
 4. **Robot-frame integration — next:** Add the measured static transform from `base_link` to `camera_link`, change the mapper's tracking frame to `base_link`, and verify that only one component publishes each dynamic TF edge.
 5. **Wheel odometry — next:** Feed calibrated wheel odometry into the robot state estimator. Use it as a motion prior or external odometry source without allowing two nodes to publish competing `odom` transforms.
 6. **LiDAR and navigation — later:** Add the RPLIDAR scan after visual mapping is stable, generate a 2D occupancy grid, and connect the resulting `map -> odom -> base_link` tree to Nav2.
-7. **RGB products — optional:** Keep RGB independent for detection or logging, or validate a separate aligned RGB-D mapping mode when a colored map is required.
+7. **RGB-D efficiency trial — implemented, hardware validation pending:** Run the wiki-derived aligned RGB-D mode and compare its tracking quality, CPU load, frame continuity, and power against raw stereo on the target Jetson.
+
+## Wiki-derived RGB-D mode
+
+The official [RealSense SLAM with D435i wiki](https://github.com/realsenseai/realsense-ros/wiki/SLAM-with-D435i) provides a useful architecture: RealSense camera, Madgwick, RTAB-Map, and `robot_localization`. However, it was written for ROS 1 Kinetic in 2019. Its package names, commands, rosbag format, and `opensource_tracking.launch` file should not be copied directly into a ROS 2 Humble system.
+
+The repository's `d435if_rgbd_slam.launch.py` preserves that four-stage design while updating it for ROS 2:
+
+```text
+D435IF color + hardware depth ──> RTAB-Map RGB-D odometry ──┐
+                                                           ├──> robot_localization EKF
+D435IF gyro + accel ──> Madgwick orientation ──────────────┘            │
+                                                                        v
+                                                           RTAB-Map pose graph
+```
+
+TF ownership is explicit:
+
+- `rgbd_odometry` publishes `/visual_odom` but does not publish TF.
+- `robot_localization` publishes the continuous `odom -> camera_link` TF.
+- RTAB-Map publishes the globally corrected `map -> odom` TF.
+- The RealSense driver publishes only the static camera sensor transforms.
+
+Start the power-conscious mode:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/rosbot/install/setup.bash
+export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+unset RMW_IMPLEMENTATION
+unset ROS_LOCALHOST_ONLY
+
+ros2 launch rover_slam d435if_rgbd_slam.launch.py
+```
+
+Visualization is disabled by default. Enable it during development:
+
+```bash
+ros2 launch rover_slam d435if_rgbd_slam.launch.py rtabmap_viz:=true
+```
+
+Continue an existing database:
+
+```bash
+ros2 launch rover_slam d435if_rgbd_slam.launch.py new_map:=false
+```
+
+Power-oriented defaults include:
+
+- The D435IF's onboard depth engine supplies depth instead of host-side raw-stereo triangulation.
+- Infrared image publication is disabled in RGB-D mode.
+- Driver point-cloud generation is disabled; RTAB-Map creates map products only as needed.
+- Color and depth are limited to `640x480x6`.
+- RTAB-Map graph updates are capped at 1 Hz while RGB-D odometry continues at the camera rate.
+- `rtabmap_viz` is disabled unless requested.
+
+All runtime processing components are compiled C++ executables: `realsense2_camera_node`, `imu_filter_madgwick_node`, `rgbd_odometry`, `ekf_node`, and `rtabmap`. The Python launch process only starts and supervises them, so rewriting the launcher in C++ would not materially change power consumption. The RealSense wrapper supports C++ component composition and intra-process communication, but zero-copy requires compatible consumers in the same component container; RTAB-Map and the other nodes should only be migrated to composition after profiling proves message copies are a significant cost.
+
+Do not assume that RGB-D is more efficient on every platform. Depth-to-color alignment consumes host resources, and WSL USB/IP behavior is not representative of native Jetson power. Benchmark both launch modes on the target computer using the same route and profiles.
 
 ## 9. Start the complete stereo, IMU, RGB, and RTAB-Map stack
 

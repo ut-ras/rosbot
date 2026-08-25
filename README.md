@@ -6,6 +6,11 @@ Designed to run on Jetson Orin Nano (Ubuntu 22.04). Development mimicked on Ubun
 For a complete Windows 11 + WSL 2 camera and stereo/IMU mapping setup, see
 [Intel RealSense D435IF on ROS 2 Humble and WSL 2](docs/d435if_wsl_ros2_setup.md).
 
+The repository provides two D435IF mapping modes:
+
+- `d435if_stereo_slam.launch.py`: raw infrared stereo plus IMU.
+- `d435if_rgbd_slam.launch.py`: power-conscious, wiki-derived RGB-D plus IMU and EKF.
+
 ## Hardware
 - Jetson Orin Nano
 - Intel RealSense D435if (RGB-D + IMU)
