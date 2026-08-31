@@ -1,14 +1,18 @@
 # Intel RealSense D435IF on ROS 2 Humble and WSL 2
 
-This guide sets up an Intel RealSense D435IF on a Windows computer running Ubuntu 22.04 under WSL 2. It covers USB forwarding, a WSL-compatible librealsense build, the ROS 2 camera wrapper, infrared stereo odometry, IMU orientation filtering, RTAB-Map, optional RGB streaming, verification, and recovery procedures.
+This guide sets up an Intel RealSense D435IF on a Windows computer running Ubuntu 22.04 under WSL 2. It covers USB forwarding, a WSL-compatible librealsense build, the ROS 2 camera wrapper, RGB-D and infrared stereo odometry, IMU orientation filtering, EKF sensor fusion, RTAB-Map, verification, and recovery procedures.
 
-The tested mapping pipeline is:
+The final validated color-mapping pipeline is:
 
 ```text
-D435IF infrared stereo ──> RTAB-Map stereo odometry ──> RTAB-Map
-          D435IF IMU ──> Madgwick orientation ────────────┘
-          D435IF RGB ──> independent ROS image topic
+D435IF color + aligned depth ──> RTAB-Map RGB-D odometry ──┐
+                                                           ├──> robot_localization EKF
+D435IF gyro + accel ──> Madgwick roll/pitch ───────────────┘            │
+                                                                        v
+                                                           RTAB-Map pose graph
 ```
+
+The repository also retains a lower-bandwidth raw infrared stereo mode as a fallback when simultaneous RGB-D streaming is unreliable through WSL USB/IP.
 
 > [!IMPORTANT]
 > WSL 2 does not receive physical USB devices directly. The camera must be attached to WSL with `usbipd-win` after Windows, WSL, or the camera restarts. Native Ubuntu on the robot does not require the USB/IP steps.
@@ -23,6 +27,7 @@ D435IF infrared stereo ──> RTAB-Map stereo odometry ──> RTAB-Map
 - [5. Install mapping dependencies](#5-install-mapping-dependencies)
 - [6. Build a WSL-compatible librealsense](#6-build-a-wsl-compatible-librealsense)
 - [7. Build the ROS workspace](#7-build-the-ros-workspace)
+- [Runtime environment for every ROS terminal](#runtime-environment-for-every-ros-terminal)
 - [8. Verify the SDK and camera](#8-verify-the-sdk-and-camera)
 - [How the mapping algorithm works](#how-the-mapping-algorithm-works)
 - [Implementation roadmap](#implementation-roadmap)
@@ -175,7 +180,10 @@ sudo apt install -y \
   ros-humble-librealsense2 \
   ros-humble-rtabmap-ros \
   ros-humble-imu-filter-madgwick \
+  ros-humble-robot-localization \
+  ros-humble-rmw-cyclonedds-cpp \
   ros-humble-rqt-image-view \
+  ros-humble-tf2-tools \
   python3-rosdep \
   python3-colcon-common-extensions
 
@@ -265,7 +273,7 @@ Build the source RealSense wrapper against the selected SDK:
 
 ```bash
 source /opt/ros/humble/setup.bash
-export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 cd ~/rosbot
 rm -rf build/realsense2_camera build/realsense2_camera_msgs
@@ -282,7 +290,7 @@ Source the finished workspace:
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/rosbot/install/setup.bash
-export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 ```
 
 Verify which librealsense the source wrapper loads:
@@ -297,6 +305,46 @@ The result should point to `/usr/local/lib/librealsense2.so.<matching-version>`.
 > [!NOTE]
 > A symlinked install can cause `find -type f` to miss installed package libraries and executables. Inspect the known path directly or allow symlinks in the search.
 
+## Runtime environment for every ROS terminal
+
+The camera launch and every monitoring terminal must use the same ROS domain and middleware. The validated WSL configuration uses CycloneDDS on domain 42:
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/rosbot/install/setup.bash
+
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+unset ROS_LOCALHOST_ONLY
+unset ROS_DISCOVERY_SERVER
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+unset CYCLONEDDS_URI
+```
+
+Domain 42 is not intrinsically special, but every process that must communicate must use the same value. The explicit CycloneDDS selection avoids the Fast DDS shared-memory lock failures encountered after crashed WSL processes. Do not set `ROS_LOCALHOST_ONLY=1`; loopback-only discovery was unreliable in the tested WSL environment.
+
+For the nested checkout layout used during initial development (`~/rosbot/rosbot` contains `.git`, while `~/rosbot` contains `build`, `install`, and `log`), update and rebuild with:
+
+```bash
+cd ~/rosbot/rosbot
+git pull origin main
+
+cd ~/rosbot
+source /opt/ros/humble/setup.bash
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+colcon build \
+  --base-paths rosbot/src \
+  --packages-select rover_slam \
+  --symlink-install
+
+source ~/rosbot/install/setup.bash
+```
+
+For the recommended layout where the Git checkout itself is `~/rosbot`, omit `--base-paths rosbot/src` and build from `~/rosbot` normally.
+
 ## 8. Verify the SDK and camera
 
 Stop the native Windows RealSense Viewer before attaching the camera to WSL. Verify without `sudo`:
@@ -304,7 +352,7 @@ Stop the native Windows RealSense Viewer before attaching the camera to WSL. Ver
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/rosbot/install/setup.bash
-export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 rs-enumerate-devices
 ```
@@ -326,7 +374,7 @@ For firmware updates, detach the camera from WSL and use the native Windows Real
 7. **Graph optimization:** When constraints are added, RTAB-Map optimizes the pose graph. The `odom` frame remains locally continuous, while the `map` to `odom` transform absorbs global corrections from loop closures.
 8. **Map output:** Optimized poses place the stereo-derived 3D observations into a consistent global map. The current stereo pipeline uses infrared imagery, so its visual map is grayscale. The optional RGB topic is published independently and is not automatically fused into standard stereo RTAB-Map.
 
-This is stereo visual odometry aided by a filtered IMU orientation. It is not a tightly coupled visual-inertial optimizer: the camera remains responsible for translation and most tracking constraints, while the IMU primarily supplies gravity alignment and a rotation estimate.
+Both provided modes are visual odometry aided by filtered IMU orientation, not tightly coupled visual-inertial optimizers. The camera remains responsible for translation and yaw tracking. In RGB-D mode, Madgwick roll/pitch and visual pose are fused by `robot_localization`; IMU yaw and Z angular velocity are deliberately excluded because the D435IF has no magnetometer.
 
 The main transforms are conceptually:
 
@@ -342,12 +390,12 @@ map ──loop-closure correction──> odom ──stereo odometry──> camer
 ## Implementation roadmap
 
 1. **Repeatable sensor bringup — implemented:** Forward the camera into WSL, use the RSUSB librealsense backend, enforce matching SDK versions, and verify both infrared images plus the combined IMU.
-2. **Single-command mapping — implemented:** `d435if_stereo_slam.launch.py` starts the camera, Madgwick, RTAB-Map stereo odometry, mapping, and visualization with the tested topic names and synchronization settings.
+2. **Single-command mapping — implemented:** The RGB-D and stereo launchers start the camera, Madgwick, odometry, mapping, and optional visualization with the tested topic names and synchronization settings.
 3. **Repeatable datasets — next:** Record stereo, camera-info, IMU, and TF topics in rosbag2. Use a fixed indoor route and compare frame gaps, odometry inliers, drift, loop closures, and CPU load after every parameter change.
 4. **Robot-frame integration — next:** Add the measured static transform from `base_link` to `camera_link`, change the mapper's tracking frame to `base_link`, and verify that only one component publishes each dynamic TF edge.
 5. **Wheel odometry — next:** Feed calibrated wheel odometry into the robot state estimator. Use it as a motion prior or external odometry source without allowing two nodes to publish competing `odom` transforms.
-6. **LiDAR and navigation — later:** Add the RPLIDAR scan after visual mapping is stable, generate a 2D occupancy grid, and connect the resulting `map -> odom -> base_link` tree to Nav2.
-7. **RGB-D efficiency trial — implemented, hardware validation pending:** Run the wiki-derived aligned RGB-D mode and compare its tracking quality, CPU load, frame continuity, and power against raw stereo on the target Jetson.
+6. **LiDAR and navigation — next:** Add the RPLIDAR scan after visual mapping is stable, generate a 2D occupancy grid, and connect the resulting `map -> odom -> base_link` tree to Nav2.
+7. **RGB-D efficiency trial — WSL validation complete:** The aligned RGB-D mode now maps successfully with low stationary drift. Native Jetson power and performance measurements remain to be collected.
 
 ## Wiki-derived RGB-D mode
 
@@ -375,14 +423,20 @@ Start the power-conscious mode:
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/rosbot/install/setup.bash
-export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
-unset RMW_IMPLEMENTATION
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 unset ROS_LOCALHOST_ONLY
+unset ROS_DISCOVERY_SERVER
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+unset CYCLONEDDS_URI
 
-ros2 launch rover_slam d435if_rgbd_slam.launch.py
+ros2 launch rover_slam d435if_rgbd_slam.launch.py \
+  rtabmap_viz:=true \
+  new_map:=true
 ```
 
-Visualization is disabled by default. Enable it during development:
+Visualization is disabled by default to save CPU. Enable it during development:
 
 ```bash
 ros2 launch rover_slam d435if_rgbd_slam.launch.py rtabmap_viz:=true
@@ -394,6 +448,39 @@ Continue an existing database:
 ros2 launch rover_slam d435if_rgbd_slam.launch.py new_map:=false
 ```
 
+The stationary-drift controls default to the validated values below and can be overridden explicitly:
+
+```bash
+ros2 launch rover_slam d435if_rgbd_slam.launch.py \
+  rtabmap_viz:=true \
+  new_map:=false \
+  linear_update:=0.1 \
+  angular_update:=0.1
+```
+
+- `linear_update` is the minimum translation in meters before RTAB-Map updates the graph.
+- `angular_update` is the minimum rotation in radians before RTAB-Map updates the graph.
+- The EKF intentionally ignores IMU yaw orientation and Z-axis angular velocity. The D435IF has no magnetometer, so neither is a stable absolute heading reference.
+
+`new_map:=false` reopens the database and continues mapping. It is not localization-only mode. A future localization launch should set RTAB-Map's `Mem/IncrementalMemory` to `false` and `Mem/InitWMWithAllNodes` to `true` so that the saved graph is not extended.
+
+Useful RGB-D launch arguments are:
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `color_profile` | `640x480x6` | Color resolution and frame rate. |
+| `depth_profile` | `640x480x6` | Hardware-depth resolution and frame rate. |
+| `frame_id` | `camera_link` | Tracking frame. Change to `base_link` only after publishing a measured static camera transform. |
+| `new_map` | `true` | Delete the previous database before launch. Use `false` to reopen and extend it. |
+| `rtabmap_viz` | `false` | Start the RTAB-Map desktop GUI. |
+| `detection_rate` | `1.0` | Maximum pose-graph update rate in hertz. |
+| `linear_update` | `0.1` | Minimum translation in meters before a graph update. |
+| `angular_update` | `0.1` | Minimum rotation in radians before a graph update. |
+| `ekf_frequency` | `30.0` | Filtered odometry publication frequency in hertz. |
+| `approx_sync_max_interval` | `0.10` | Maximum RGB/depth synchronization interval in seconds. |
+| `topic_queue_size` | `30` | Queue size for individual subscribed topics. |
+| `sync_queue_size` | `30` | Queue size for synchronized RGB-D input. |
+
 Power-oriented defaults include:
 
 - The D435IF's onboard depth engine supplies depth instead of host-side raw-stereo triangulation.
@@ -401,6 +488,8 @@ Power-oriented defaults include:
 - Driver point-cloud generation is disabled; RTAB-Map creates map products only as needed.
 - Color and depth are limited to `640x480x6`.
 - RTAB-Map graph updates are capped at 1 Hz while RGB-D odometry continues at the camera rate.
+- Graph updates require at least 0.1 m translation or 0.1 rad rotation, reducing stationary map growth from visual jitter.
+- Madgwick supplies roll and pitch, while visual odometry remains responsible for yaw.
 - `rtabmap_viz` is disabled unless requested.
 
 All runtime processing components are compiled C++ executables: `realsense2_camera_node`, `imu_filter_madgwick_node`, `rgbd_odometry`, `ekf_node`, and `rtabmap`. The Python launch process only starts and supervises them, so rewriting the launcher in C++ would not materially change power consumption. The RealSense wrapper supports C++ component composition and intra-process communication, but zero-copy requires compatible consumers in the same component container; RTAB-Map and the other nodes should only be migrated to composition after profiling proves message copies are a significant cost.
@@ -416,9 +505,13 @@ After rebuilding the workspace, start the known-good stereo/IMU mapper with one 
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/rosbot/install/setup.bash
-export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
-unset RMW_IMPLEMENTATION
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 unset ROS_LOCALHOST_ONLY
+unset ROS_DISCOVERY_SERVER
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+unset CYCLONEDDS_URI
 
 ros2 launch rover_slam d435if_stereo_slam.launch.py
 ```
@@ -455,9 +548,13 @@ The following separate-terminal procedure exposes each pipeline stage individual
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/rosbot/install/setup.bash
-export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
-unset RMW_IMPLEMENTATION
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 unset ROS_LOCALHOST_ONLY
+unset ROS_DISCOVERY_SERVER
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+unset CYCLONEDDS_URI
 
 ros2 launch realsense2_camera rs_launch.py \
   initial_reset:=false \
@@ -497,9 +594,13 @@ The RealSense combined IMU topic contains angular velocity and acceleration but 
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/rosbot/install/setup.bash
-export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
-unset RMW_IMPLEMENTATION
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 unset ROS_LOCALHOST_ONLY
+unset ROS_DISCOVERY_SERVER
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+unset CYCLONEDDS_URI
 
 ros2 run imu_filter_madgwick imu_filter_madgwick_node \
   --ros-args \
@@ -517,9 +618,13 @@ Keep the camera stationary for several seconds while the filter initializes.
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/rosbot/install/setup.bash
-export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
-unset RMW_IMPLEMENTATION
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 unset ROS_LOCALHOST_ONLY
+unset ROS_DISCOVERY_SERVER
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+unset CYCLONEDDS_URI
 
 ros2 launch rtabmap_launch rtabmap.launch.py \
   stereo:=true \
@@ -549,10 +654,15 @@ Move the camera slowly through a well-lit, textured scene. Sideways motion provi
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/rosbot/install/setup.bash
-unset RMW_IMPLEMENTATION
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 unset ROS_LOCALHOST_ONLY
+unset ROS_DISCOVERY_SERVER
+unset FASTRTPS_DEFAULT_PROFILES_FILE
+unset CYCLONEDDS_URI
 
-ros2 node list
+timeout 15s ros2 node list --no-daemon
 
 timeout 15s ros2 topic hz /camera/camera/infra1/image_rect_raw
 timeout 15s ros2 topic hz /camera/camera/infra2/image_rect_raw
@@ -572,7 +682,7 @@ Select `/camera/camera/color/image_raw` in the topic selector.
 
 ## 10. Expected topics and rates
 
-With the launch configuration above:
+With the stereo launch configuration above:
 
 | Topic | Purpose | Expected rate |
 | --- | --- | ---: |
@@ -594,6 +704,27 @@ Expected nodes include:
 
 The first warning from `ros2 topic hz` may say that the topic has not appeared yet. If rates are then printed continuously, the topic is publishing.
 
+With the validated RGB-D launcher, the important topics are:
+
+| Topic | Purpose | Typical rate |
+| --- | --- | ---: |
+| `/camera/camera/color/image_raw` | RGB image used for visual features | about 6.7 Hz |
+| `/camera/camera/aligned_depth_to_color/image_raw` | Depth aligned to RGB | about 6.7 Hz |
+| `/camera/camera/imu` | Combined raw accelerometer and gyroscope | about 200-220 Hz |
+| `/imu/data` | Madgwick-filtered orientation | about 200-220 Hz |
+| `/visual_odom` | RTAB-Map RGB-D visual odometry | camera-dependent; often below image rate in WSL |
+| `/odometry/filtered` | EKF output used by RTAB-Map | up to 30 Hz |
+
+Expected RGB-D nodes include:
+
+```text
+/camera/camera
+/imu_filter_madgwick
+/rtabmap/rgbd_odometry
+/ekf_filter_node
+/rtabmap/rtabmap
+```
+
 ## 11. Saving and reopening a map
 
 RTAB-Map stores its default database at:
@@ -607,16 +738,16 @@ Stop RTAB-Map normally with Ctrl+C and wait for `Saving database/long-term memor
 For a new map, use:
 
 ```bash
-rtabmap_args:="-d"
+ros2 launch rover_slam d435if_rgbd_slam.launch.py new_map:=true
 ```
 
 To reopen and extend the existing database, use:
 
 ```bash
-rtabmap_args:=""
+ros2 launch rover_slam d435if_rgbd_slam.launch.py new_map:=false
 ```
 
-Shut down the stack in reverse order: RTAB-Map, Madgwick, then RealSense.
+The unified launch owns all stages, so stop it once with Ctrl+C and wait for the database-save completion message.
 
 ## 12. RGB behavior
 
@@ -649,7 +780,7 @@ cd /path/to/the/checkout
 test -d .git && test -d src && echo "Repository root confirmed"
 ```
 
-Avoid cloning the repository inside an already-created `~/rosbot` directory, which can accidentally produce `~/rosbot/rosbot`.
+Avoid cloning the repository inside an already-created `~/rosbot` directory unless you intentionally use the nested workspace layout documented above. In that layout, run Git commands from `~/rosbot/rosbot` and build from `~/rosbot` with `--base-paths rosbot/src`.
 
 ### `No device detected` after the camera worked previously
 
@@ -748,18 +879,59 @@ An error such as:
 RTPS_TRANSPORT_SHM Error: Failed init_port fastrtps_port....
 ```
 
-usually indicates a stale shared-memory lock after a crashed ROS process. Parameters may still be set successfully, but image performance can suffer if DDS falls back to UDP. Stop all ROS processes, run `wsl --shutdown` from PowerShell, reopen Ubuntu, reattach the camera, and restart the stack.
+usually indicates a stale shared-memory lock after a crashed ROS process. The validated setup avoids this path by selecting CycloneDDS explicitly in every terminal:
+
+```bash
+export ROS_DOMAIN_ID=42
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+unset ROS_LOCALHOST_ONLY
+```
+
+If the error persists, an old process was started with Fast DDS. Stop all ROS processes, run `wsl --shutdown` from PowerShell, reopen Ubuntu, reattach the camera, and restart every node with the common runtime environment.
 
 ### ROS CLI appears to freeze
 
 The first ROS 2 CLI invocation may spend time importing Python plugins or waiting for DDS discovery. Allow it to finish or bound diagnostic commands:
 
 ```bash
-timeout 30s ros2 node list
-timeout 30s ros2 topic list
+timeout 30s ros2 node list --no-daemon
+timeout 30s ros2 topic list --no-daemon
 ```
 
-Do not switch DDS implementations while diagnosing the camera. All terminals must use compatible ROS domain and middleware settings.
+If discovery is still empty, first verify the node process exists with `pgrep -af realsense`. Test ROS independently with `demo_nodes_cpp` talker and listener in two terminals. All terminals must use the same `ROS_DOMAIN_ID` and `RMW_IMPLEMENTATION`; changing only the monitoring terminal will not work.
+
+### IMU topics exist but `ros2 topic echo` hangs
+
+The generic CLI echo command was unreliable in the tested WSL environment even when compiled subscribers and `ros2 topic hz` received data correctly. Treat stable rates on all three topics as proof that the camera-side IMU pipeline is working:
+
+```bash
+timeout 10s ros2 topic hz /camera/camera/gyro/sample
+timeout 10s ros2 topic hz /camera/camera/accel/sample
+timeout 10s ros2 topic hz /camera/camera/imu
+timeout 10s ros2 topic hz /imu/data
+```
+
+Expected rates are approximately 200 Hz gyro, 100 Hz accelerometer, and 200-220 Hz combined and filtered IMU. Madgwick warnings that it is still waiting for `imu/data_raw` indicate that `/camera/camera/imu` is not reaching the filter.
+
+### The map moves while the camera is stationary
+
+First confirm that the updated launcher exposes `linear_update` and `angular_update`:
+
+```bash
+ros2 launch rover_slam d435if_rgbd_slam.launch.py --show-args \
+  | grep -E 'linear_update|angular_update'
+```
+
+Use `0.1` for both initially. The EKF configuration in the current launcher ignores IMU yaw and Z angular velocity, preventing magnetometer-free gyro bias from continuously rotating the map. Small residual motion is expected from RGB-D visual odometry. Wheel odometry is the preferred next constraint for a ground rover.
+
+To distinguish local odometry movement from global RTAB-Map corrections, keep the camera motionless and inspect both transforms:
+
+```bash
+timeout 30s ros2 run tf2_ros tf2_echo odom camera_link
+timeout 30s ros2 run tf2_ros tf2_echo map odom
+```
+
+If `odom` does not exist, verify the pipeline in order: color image, aligned depth, `/visual_odom`, then `/odometry/filtered`.
 
 ### RTAB-Map reports that it did not receive data
 
