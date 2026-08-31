@@ -34,7 +34,13 @@ def _launch_mapping(context):
     )
     new_map = _as_bool(LaunchConfiguration('new_map').perform(context))
     detection_rate = LaunchConfiguration('detection_rate').perform(context)
-    rtabmap_args = f'--Rtabmap/DetectionRate {detection_rate}'
+    linear_update = LaunchConfiguration('linear_update').perform(context)
+    angular_update = LaunchConfiguration('angular_update').perform(context)
+    rtabmap_args = (
+        f'--Rtabmap/DetectionRate {detection_rate} '
+        f'--RGBD/LinearUpdate {linear_update} '
+        f'--RGBD/AngularUpdate {angular_update}'
+    )
     if new_map:
         rtabmap_args = f'-d {rtabmap_args}'
 
@@ -205,7 +211,7 @@ def generate_launch_description():
                 False, False, False,
                 True, True, False,
                 False, False, False,
-                True, True, True,
+                True, True, False,
                 False, False, False,
             ],
             'imu0_differential': False,
@@ -250,6 +256,20 @@ def generate_launch_description():
             'detection_rate',
             default_value='1.0',
             description='Maximum RTAB-Map graph-update rate in Hz.',
+        ),
+        DeclareLaunchArgument(
+            'linear_update',
+            default_value='0.1',
+            description=(
+                'Minimum translation in meters before adding a map update.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'angular_update',
+            default_value='0.1',
+            description=(
+                'Minimum rotation in radians before adding a map update.'
+            ),
         ),
         DeclareLaunchArgument(
             'ekf_frequency',
